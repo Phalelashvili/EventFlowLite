@@ -21,17 +21,19 @@ public class AggregateCommandCommitter<TAggregate, TId>
     private readonly TAggregate _aggregate;
     private readonly IAggregateCommandBase<TAggregate, TId> _command;
     private readonly ILogger _logger;
+    private readonly ILoggerFactory _loggerFactory;
 
     public AggregateCommandCommitter(DbContext dbContext, IDomainEventPublisher domainEventPublisher,
         TAggregate aggregate, IAggregateCommandBase<TAggregate, TId> command,
-        ILogger logger)
+        ILoggerFactory loggerFactory)
     {
         _dbContext = dbContext;
         _repository = new EfCoreAggregateRepository<DbContext, TAggregate, TId>(_dbContext);
         _domainEventPublisher = domainEventPublisher;
         _aggregate = aggregate;
         _command = command;
-        _logger = logger;
+        _loggerFactory = loggerFactory;
+        _logger = _loggerFactory.CreateLogger("AggregateCommandCommitter");
     }
 
     /// <summary>
@@ -39,7 +41,7 @@ public class AggregateCommandCommitter<TAggregate, TId>
     /// </summary>
     public async Task CommitAsync(CancellationToken cancellationToken)
     {
-        if (FlushEventsAndLog(out var aggregateEvents) == false)
+        if (FlushEventsAndLog(out var aggregateEvents) is false)
             return;
 
         Dictionary<IAggregateEvent<TAggregate, TId>, DomainEventEntity> eventToEntityMapping;
@@ -62,7 +64,7 @@ public class AggregateCommandCommitter<TAggregate, TId>
 
         // in case publisher fails -- we want to know which events were not processed
         // so they can be re-published (don't have mechanism for that atm, lol)
-        await TryPublishDomainEventsAsync(eventToEntityMapping);
+        await TryPublishDomainEventsAsync(eventToEntityMapping, cancellationToken);
     }
 
     private async Task SaveDomainEventEntitiesAsync(CancellationToken cancellationToken,
@@ -71,7 +73,7 @@ public class AggregateCommandCommitter<TAggregate, TId>
         await _dbContext.Set<DomainEventEntity>()
             .AddRangeAsync(eventToEntityMapping.Values, cancellationToken);
 
-        await SaveChangesAsync();
+        await SaveChangesAsync(cancellationToken);
     }
 
     /// <summary>
@@ -80,7 +82,7 @@ public class AggregateCommandCommitter<TAggregate, TId>
     private async Task SaveAddedEntriesIfAnyAsync(CancellationToken cancellationToken)
     {
         if (_dbContext.EntitiesWereAdded())
-            await SaveChangesAsync();
+            await SaveChangesAsync(cancellationToken);
     }
 
     private async Task TryRollbackTransactionAsync(IDbContextTransaction transaction)
@@ -125,24 +127,25 @@ public class AggregateCommandCommitter<TAggregate, TId>
     }
 
     private async Task TryPublishDomainEventsAsync(
-        Dictionary<IAggregateEvent<TAggregate, TId>, DomainEventEntity> eventToEntityMapping)
+        Dictionary<IAggregateEvent<TAggregate, TId>, DomainEventEntity> eventToEntityMapping,
+        CancellationToken cancellationToken)
     {
         var domainEventCommitter = new DomainEventCommitter<TAggregate, TId>(
             _dbContext,
             _domainEventPublisher,
             _aggregate,
             _command,
-            _logger);
+            _loggerFactory);
 
-        await domainEventCommitter.TryPublishDomainEventsAsync(eventToEntityMapping);
+        await domainEventCommitter.TryPublishDomainEventsAsync(eventToEntityMapping, cancellationToken);
     }
     
-    private async Task SaveChangesAsync()
+    private async Task SaveChangesAsync(CancellationToken cancellationToken)
     {
         // changes are saved through IRepository solely to re-use concurrency code in its SaveChangesAsync method.
         // other solution would be to override save method in DbContext, (all of them, or make new base class).
         // but i think this is cleaner.
         // or to expose db context & transactions in IRepository.
-        await _repository.SaveChangesAsync();
+        await _repository.SaveChangesAsync(cancellationToken);
     }
 }

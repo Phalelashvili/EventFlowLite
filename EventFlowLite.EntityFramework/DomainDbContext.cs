@@ -6,9 +6,9 @@ using Microsoft.EntityFrameworkCore;
 
 namespace EventFlowLite.EntityFramework;
 
-public class ApplicationDbContext : DbContext
+public class DomainDbContext : DbContext
 {
-    public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options) : base(options)
+    public DomainDbContext(DbContextOptions<DomainDbContext> options) : base(options)
     {
     }
 

@@ -13,12 +13,12 @@ using Serilog.Context;
 namespace EventFlowLite.EntityFramework.Command;
 
 [PrimaryConstructor]
-public partial class CommandBus : ICommandBus
+internal sealed partial class CommandBus : ICommandBus
 {
-    private readonly ApplicationDbContext _dbContext;
+    private readonly DomainDbContext _dbContext;
     private readonly IDomainEventPublisher _domainEventPublisher;
-    private readonly ILogger<CommandBus> _logger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly ILoggerFactory _loggerFactory;
 
     #region Create Aggregate
     
@@ -29,13 +29,13 @@ public partial class CommandBus : ICommandBus
     /// <exception cref="AggregateDoesNotExistError"></exception>
     /// <exception cref="AggregateVersionMismatchError"></exception>
     public async Task<TAggregate> PublishAsync<TAggregate, TId>(ICreateAggregateCommand<TAggregate, TId> command,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken)
         where TAggregate : AggregateRoot<TAggregate, TId>, new()
         where TId : IComparable
     {
         LogContext.Push(new CommandBaseLogEnricher<TAggregate, TId>(command));
         
-        await EnsureIdempotencyAsync(command);
+        await EnsureIdempotencyAsync(command, cancellationToken);
         
         var agr = new TAggregate();
 
@@ -54,11 +54,12 @@ public partial class CommandBus : ICommandBus
     /// </summary>
     /// <exception cref="CommandIdIsEmptyException"></exception>
     /// <exception cref="CommandAlreadyHandledException"></exception>
-    private async Task EnsureIdempotencyAsync<TAggregate, TId>(IAggregateCommandBase<TAggregate, TId> command)
+    private async Task EnsureIdempotencyAsync<TAggregate, TId>(IAggregateCommandBase<TAggregate, TId> command,
+        CancellationToken cancellationToken)
         where TAggregate : AggregateRoot<TAggregate, TId>
         where TId : IComparable
     {
-        if (string.IsNullOrEmpty(command.Params?.CommandId))
+        if (string.IsNullOrWhiteSpace(command.Params?.CommandId))
             throw new CommandIdIsEmptyException();
         
         var aggregateName = typeof(TAggregate).PrettyPrint();
@@ -69,7 +70,7 @@ public partial class CommandBus : ICommandBus
             .AnyAsync(e => 
                 e.AggregateName == aggregateName && 
                 e.CommandName == commandName && 
-                e.CommandParams.CommandId == commandId);
+                e.CommandParams.CommandId == commandId, cancellationToken);
         if (eventExistsWithCommandParams)
             throw new CommandAlreadyHandledException(aggregateName, null, commandName, commandId);
     }
@@ -85,7 +86,7 @@ public partial class CommandBus : ICommandBus
     /// <exception cref="AggregateDoesNotExistError"></exception>
     /// <exception cref="AggregateVersionMismatchError"></exception>
     public async Task<TAggregate> PublishAsync<TAggregate, TId>(ICommand<TAggregate, TId> command,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken)
         where TAggregate : AggregateRoot<TAggregate, TId>
         where TId : IComparable
     {
@@ -93,12 +94,20 @@ public partial class CommandBus : ICommandBus
 
         // NOTE: aggregate must be loaded before ensuring idempotency, so that in case same command gets handled
         // concurrently, concurrency error will be thrown. TODO: figure out a way to do this with database constraints?
-        var agr = await FindVersionedAggregateOrThrowAsync(command);
+        var agr = await FindVersionedAggregateOrThrowAsync(command, cancellationToken);
 
-        await EnsureIdempotencyAsync(command);
+        await EnsureIdempotencyAsync(command, cancellationToken);
         
         var handlerType = CommandHandlerTypeMaker.MakeCommandHandlerTypeAndCache<TAggregate, TId>(command.GetType());
-        await HandleAsync<TAggregate, TId>(handlerType, agr, command, cancellationToken);
+        try
+        {
+            await HandleAsync<TAggregate, TId>(handlerType, agr, command, cancellationToken);
+        }
+        catch
+        {
+            ResetModifiedAggregateState<TAggregate, TId>();
+            throw;
+        }
 
         await CommitAsync(agr, command, cancellationToken);
 
@@ -110,11 +119,12 @@ public partial class CommandBus : ICommandBus
     /// </summary>
     /// <exception cref="CommandIdIsEmptyException"></exception>
     /// <exception cref="CommandAlreadyHandledException"></exception>
-    private async Task EnsureIdempotencyAsync<TAggregate, TId>(ICommand<TAggregate, TId> command)
+    private async Task EnsureIdempotencyAsync<TAggregate, TId>(ICommand<TAggregate, TId> command,
+        CancellationToken cancellationToken)
         where TAggregate : class, IAggregateRoot<TAggregate, TId>
         where TId : IComparable
     {
-        if (string.IsNullOrEmpty(command.Params?.CommandId))
+        if (string.IsNullOrWhiteSpace(command.Params?.CommandId))
             throw new CommandIdIsEmptyException();
 
         var aggregateName = typeof(TAggregate).PrettyPrint();
@@ -127,21 +137,22 @@ public partial class CommandBus : ICommandBus
                 e.AggregateName == aggregateName &&
                 e.AggregateId == aggregateId && 
                 e.CommandName == commandName &&
-                e.CommandParams.CommandId == commandId);
+                e.CommandParams.CommandId == commandId, cancellationToken);
         if (eventExistsWithCommandId)
             throw new CommandAlreadyHandledException(aggregateName, aggregateId, commandName, commandId);
     }
 
-    private async Task<TAggregate> FindVersionedAggregateOrThrowAsync<TAggregate, TId>(ICommand<TAggregate, TId> command)
+    private async Task<TAggregate> FindVersionedAggregateOrThrowAsync<TAggregate, TId>(
+        ICommand<TAggregate, TId> command, CancellationToken cancellationToken)
         where TAggregate : class, IAggregateRoot<TAggregate, TId> where TId : IComparable
     {
-        var agr = await _dbContext.Set<TAggregate>().FindAsync(command.Id);
+        var agr = await _dbContext.Set<TAggregate>().FindAsync(new object[]{command.Id}, cancellationToken);
         if (agr is null)
             throw new AggregateDoesNotExistError(typeof(TAggregate), command.Id);
         if (command.Params.ExpectedVersion.HasValue && command.Params.ExpectedVersion.Value != agr.AggregateVersion)
             throw new AggregateVersionMismatchError(command.Params.ExpectedVersion.Value, agr.AggregateVersion);
         // NOTE: if aggregate version changes while we're modifying it,
-        // while saving changes -- ConcurrencyVersion check will exception 
+        // while saving changes -- ConcurrencyVersion check will throw exception 
         return agr;
     }
 
@@ -188,8 +199,30 @@ public partial class CommandBus : ICommandBus
             _domainEventPublisher,
             agr,
             command,
-            _logger);
+            _loggerFactory);
         await committer.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    ///  resets entity state to Unchanged if it was modified.
+    ///  since DbContext is not disposed, in-memory copy of aggregate might contain changes that were
+    /// NOT SAVED TO DATABASE AND SHOULD NOT BE CARRIED OVER TO NEXT HANDLER.
+    ///
+    /// aggregate, command handler, or command bus itself might have thrown an exception,
+    /// these might result in events not being published, but aggregate instance in memory being changed.
+    ///
+    ///  to overcome this, we can set state of EF Entity to Unchanged and let EF restore original object.
+    /// NOTE: that this does not query the database like EntityEntry.Reload() would.
+    /// NOTE: that we don't reset state for other db contexts, since they are not managed by command bus,
+    /// so they will (supposedly) fail in command handler if they are not saved.
+    /// </summary>
+    private void ResetModifiedAggregateState<TAggregate, TId>()
+        where TAggregate : IAggregateRoot<TAggregate, TId>
+        where TId : IComparable
+    {
+        foreach (var entityEntry in _dbContext.ChangeTracker.Entries())
+            if (entityEntry.State is EntityState.Modified)
+                entityEntry.State = EntityState.Unchanged;
     }
     
     #endregion

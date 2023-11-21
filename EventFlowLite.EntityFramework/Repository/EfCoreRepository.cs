@@ -25,7 +25,7 @@ public class EfCoreRepository<TContext, TEntity, TId> : IRepository<TEntity, TId
         return DbSet.AsQueryable();
     }
 
-    public Task SaveChangesAsync()
+    public Task SaveChangesAsync(CancellationToken cancellationToken)
     {
         var entries = DbContext.ChangeTracker.Entries()
             .Where(e => e.State is EntityState.Added or EntityState.Modified ||
@@ -46,37 +46,60 @@ public class EfCoreRepository<TContext, TEntity, TId> : IRepository<TEntity, TId
                 entity.DateTimeCreated = now;
         }
 
-        return DbContext.SaveChangesAsync();
+        return DbContext.SaveChangesAsync(cancellationToken);
     }
 
-    public Task<TEntity?> FirstOrDefaultAsync(Expression<Func<TEntity, bool>> predicate, bool track = false,
+    public Task<TEntity?> FirstOrDefaultAsync(Expression<Func<TEntity, bool>> predicate, 
+        CancellationToken cancellationToken, bool track = false,
         params Expression<Func<TEntity, object>>[] lazySelectors)
     {
         return DbSet
             .WithLazySelectors<TEntity, TId>(lazySelectors)
             .WithTracking<TEntity, TId>(track)
-            .FirstOrDefaultAsync(predicate);
+            .FirstOrDefaultAsync(predicate, cancellationToken: cancellationToken);
     }
-
-    public async Task<TEntity> FirstAsync(Expression<Func<TEntity, bool>> predicate, bool track = false,
+    public Task<TEntity?> LastOrDefaultAsync(Expression<Func<TEntity, bool>> predicate, 
+        CancellationToken cancellationToken, bool track = false,
         params Expression<Func<TEntity, object>>[] lazySelectors)
     {
-        var entity = await FirstOrDefaultAsync(predicate, track, lazySelectors);
+        return DbSet
+            .WithLazySelectors<TEntity, TId>(lazySelectors)
+            .WithTracking<TEntity, TId>(track)
+            .OrderByDescending(entity => entity.Id)
+            .LastOrDefaultAsync(predicate, cancellationToken: cancellationToken);
+    }
+
+    public Task<TEntity?> SingleOrDefaultAsync(Expression<Func<TEntity, bool>> predicate, 
+        CancellationToken cancellationToken, bool track = false,
+        params Expression<Func<TEntity, object>>[] lazySelectors)
+    {
+        return DbSet
+            .WithLazySelectors<TEntity, TId>(lazySelectors)
+            .WithTracking<TEntity, TId>(track)
+            .SingleOrDefaultAsync(predicate, cancellationToken: cancellationToken);
+    }
+
+    public async Task<TEntity> FirstAsync(Expression<Func<TEntity, bool>> predicate,
+        CancellationToken cancellationToken, bool track = false,
+        params Expression<Func<TEntity, object>>[] lazySelectors)
+    {
+        var entity = await FirstOrDefaultAsync(predicate, cancellationToken, track, lazySelectors);
         if (entity == default)
             throw new ApplicationException($"no matching {typeof(TEntity).Name} found where {predicate}");
         return entity;
     }
 
-    public Task<List<TEntity>> QueryListAsync(Expression<Func<TEntity, bool>> predicate,
-        params Expression<Func<TEntity, object>>[] lazySelectors)
+    public Task<List<TEntity>> QueryListAsync(Expression<Func<TEntity, bool>> predicate, 
+        CancellationToken cancellationToken, params Expression<Func<TEntity, object>>[] lazySelectors)
     {
         return DbSet
             .WithLazySelectors<TEntity, TId>(lazySelectors)
             .Where(predicate)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: cancellationToken);
     }
 
-    public Task<List<TEntity>> QueryListAsync(IEnumerable<Expression<Func<TEntity, bool>>> predicates,
+    public Task<List<TEntity>> QueryListAsync(IEnumerable<Expression<Func<TEntity, bool>>> predicates, 
+        CancellationToken cancellationToken,
         params Expression<Func<TEntity, object>>[] lazySelectors)
     {
         var q = DbSet.WithLazySelectors<TEntity, TId>(lazySelectors).AsQueryable();
@@ -84,42 +107,36 @@ public class EfCoreRepository<TContext, TEntity, TId> : IRepository<TEntity, TId
         foreach (var predicate in predicates)
             q = q.Where(predicate);
 
-        return q.ToListAsync();
+        return q.ToListAsync(cancellationToken: cancellationToken);
     }
-
-    public ValueTask<TEntity?> FindManyAsync(params TId[] values)
-    {
-        return DbSet.FindAsync(values);
-    }
-
-    public ValueTask<TEntity?> FindAsync(TId value, bool track = false)
-    {
-        return DbSet.WithTracking<TEntity, TId>(track).FindAsync(value);
-    }
-
+    
     public ValueTask<TEntity?> FindAsync(TId value, CancellationToken cancellationToken, bool track = false)
     {
-        return FindAsync(value, track);
+        return DbSet.WithTracking<TEntity, TId>(track).FindAsync(new object[]{value}, cancellationToken);
     }
-    // using cancellation token as argument caused some issues with object[] overload. not important rn. TODO
 
-    public async ValueTask<TEntity> AddAsync(TEntity entity, CancellationToken cancellationToken = default)
+    public async ValueTask<TEntity> AddAsync(TEntity entity, CancellationToken cancellationToken)
     {
         var result = await DbSet.AddAsync(entity, cancellationToken);
         return result.Entity;
     }
 
-    public async Task<bool> AnyAsync(Expression<Func<TEntity, bool>> predicate)
+    public async Task<bool> AnyAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken)
     {
-        return await DbSet.AnyAsync(predicate);
+        return await DbSet.AnyAsync(predicate, cancellationToken: cancellationToken);
     }
     
-    public async Task<long> CountAsync(Expression<Func<TEntity, bool>> predicate,
+    public async Task<long> CountAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken,
         params Expression<Func<TEntity, object>>[] lazySelectors)
     {
         return await DbSet
             .WithLazySelectors<TEntity, TId>(lazySelectors)
             .Where(predicate)
-            .LongCountAsync();
+            .LongCountAsync(cancellationToken: cancellationToken);
+    }
+
+    public void Remove(TEntity entity)
+    {
+        DbSet.Remove(entity);
     }
 }

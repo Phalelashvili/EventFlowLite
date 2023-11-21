@@ -19,30 +19,31 @@ public class DomainEventCommitter<TAggregate, TId>
 
     public DomainEventCommitter(DbContext dbContext, IDomainEventPublisher domainEventPublisher,
         TAggregate aggregate, IAggregateCommandBase<TAggregate, TId> command,
-        ILogger logger)
+        ILoggerFactory loggerFactory)
     {
         _dbContext = dbContext;
         _domainEventPublisher = domainEventPublisher;
         _aggregate = aggregate;
         _command = command;
-        _logger = logger;
+        _logger = loggerFactory.CreateLogger("DomainEventCommitter");
     }
 
     /// <summary>
     /// tries to publish domain event and mark it as published in database
     /// </summary>
     public async Task TryPublishDomainEventsAsync(
-        IDictionary<IAggregateEvent<TAggregate, TId>, DomainEventEntity> eventToEntityMapping)
+        IDictionary<IAggregateEvent<TAggregate, TId>, DomainEventEntity> eventToEntityMapping,
+        CancellationToken cancellationToken)
     {
         foreach (var (aggregateEvent, eventEntity) in eventToEntityMapping)
         {
-            var succeeded = await TryPublishDomainEventAndMarkEntityAsync(aggregateEvent, eventEntity);
+            var succeeded = await TryPublishDomainEventAndMarkEntityAsync(aggregateEvent, eventEntity, cancellationToken);
 
-            if (succeeded == false)
+            if (succeeded is false)
                 // there's nothing to update, Published state is already false in database
                 continue;
 
-            await TryUpdateDomainEventEntityAsync(eventEntity);
+            await TryUpdateDomainEventEntityAsync(eventEntity, cancellationToken);
         }
     }
 
@@ -50,13 +51,16 @@ public class DomainEventCommitter<TAggregate, TId>
     /// publishes event and marks Domain Event as published in database.
     /// if failed, it is supposed to stay marked as Published = false, so we know something went wrong
     /// </summary>
-    private async Task<bool> TryPublishDomainEventAndMarkEntityAsync(
-        IAggregateEvent<TAggregate, TId> aggregateEvent, DomainEventEntity eventEntity)
+    private async Task<bool> TryPublishDomainEventAndMarkEntityAsync(IAggregateEvent<TAggregate, TId> aggregateEvent,
+        DomainEventEntity eventEntity, CancellationToken cancellationToken)
     {
         try
         {
             var domainEvent = DomainEventFactory.Create(_aggregate, _command, aggregateEvent);
-            await _domainEventPublisher.PublishAsync(domainEvent, CancellationToken.None);
+            var published = await _domainEventPublisher.PublishAsync(domainEvent, cancellationToken);
+            if (published is false)
+                return false;
+            
             eventEntity.MarkAsPublished();
             return true;
         }
@@ -72,12 +76,13 @@ public class DomainEventCommitter<TAggregate, TId>
     /// went wrong, BUT, event was already published, it's the commit that failed. in this case Idempotency should fix
     /// the issue of this event being re-published
     /// </summary>
-    private async Task TryUpdateDomainEventEntityAsync(DomainEventEntity eventEntity)
+    private async Task TryUpdateDomainEventEntityAsync(DomainEventEntity eventEntity,
+        CancellationToken cancellationToken)
     {
         try
         {
             _dbContext.Set<DomainEventEntity>().Update(eventEntity);
-            await _dbContext.SaveChangesAsync();
+            await _dbContext.SaveChangesAsync(cancellationToken);
         }
         catch (Exception e)
         {
